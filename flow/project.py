@@ -556,7 +556,7 @@ class _FlowProjectClass(type):
             _parent_class = parent_class
 
             def __init__(self, condition, _internal_lambda=False):
-                super(pre, self).__init__(condition, _internal_lambda)
+                super(post, self).__init__(condition, _internal_lambda)
 
             def __call__(self, func):
                 self._parent_class._OPERATION_POST_CONDITIONS[func].insert(0, self.condition)
