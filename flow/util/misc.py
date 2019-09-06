@@ -2,26 +2,11 @@
 # All rights reserved.
 # This software is licensed under the BSD 3-Clause License.
 import os
-import re
-import errno
 import json
 import argparse
 import logging
 from contextlib import contextmanager
-
-from signac.common import six
-
-
-def _mkdir_p(path):
-    """"Create a directory at 'path', ignore if the directory already exists.
-
-    Needed, because the 'ignore_exists' is not available in Python 2.7.
-    """
-    try:
-        os.makedirs(path)
-    except OSError as error:
-        if not (error.errno == errno.EEXIST and os.path.isdir(path)):
-            raise
+from itertools import cycle, islice
 
 
 def _positive_int(value):
@@ -164,12 +149,7 @@ def _is_identifier(name):
     Source: https://stackoverflow.com/a/2545164
     """
     if name:
-        if six.PY2:
-            import re
-            import keyword
-            return re.match(r'^[a-z_][a-z0-9_]*$', name, re.I) and not keyword.iskeyword(name)
-        else:
-            return name.isidentifier()
+        return name.isidentifier()
     else:
         return False    # empty string or None
 
@@ -195,7 +175,32 @@ class TrackGetItemDict(dict):
         return self._keys_used.copy()
 
 
-# Remove this after we drop Python 2.7 support:
-def fullmatch(regex, string, flags=0):
-    """Emulate python-3.4 re.fullmatch()."""
-    return re.match("(?:" + regex + r")\Z", string, flags=flags)
+def roundrobin(*iterables):
+    # From: https://docs.python.org/3/library/itertools.html#itertools-recipes
+    # roundrobin('ABC', 'D', 'EF') --> A D E B F C
+    # Recipe credited to George Sakkis
+    num_active = len(iterables)
+    nexts = cycle(iter(it).__next__ for it in iterables)
+    while num_active:
+        try:
+            for next in nexts:
+                yield next()
+        except StopIteration:
+            # Remove the iterator we just exhausted from the cycle.
+            num_active -= 1
+            nexts = cycle(islice(nexts, num_active))
+
+
+class _hashable_dict(dict):
+    def __hash__(self):
+        return hash(tuple(sorted(self.items())))
+
+
+def to_hashable(l):
+    # if isinstance(l, Sequence):
+    if type(l) == list:
+        return tuple(to_hashable(_) for _ in l)
+    elif type(l) == dict:
+        return _hashable_dict(l)
+    else:
+        return l

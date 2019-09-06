@@ -4,18 +4,19 @@
 from __future__ import print_function
 import unittest
 import logging
-import io
 import uuid
 import os
 import sys
 import inspect
 import subprocess
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from distutils.version import StrictVersion
+from io import StringIO
+from itertools import groupby
+from tempfile import TemporaryDirectory
 
 import signac
-from signac.common import six
 import flow
 from flow import FlowProject, cmd, with_job, directives
 from flow.scheduling.base import Scheduler
@@ -30,41 +31,6 @@ from flow import init
 from define_test_project import TestProject
 from define_test_project import TestDynamicProject
 
-if six.PY2:
-    from tempdir import TemporaryDirectory
-else:
-    from tempfile import TemporaryDirectory
-
-
-# Need to implement context managers below while supporting
-# Python versions 2.7 and 3.4. These managers are both part
-# of the the standard library as of Python version 3.5.
-
-@contextmanager
-def redirect_stdout(new_target=None):
-    "Temporarily redirect all output to stdout to new_target."
-    if new_target is None:
-        new_target = StringIO()
-    old_target = sys.stdout
-    try:
-        sys.stdout = new_target
-        yield
-    finally:
-        sys.stdout = old_target
-
-
-@contextmanager
-def redirect_stderr(new_target=None):
-    "Temporarily redirect all output to stderr to new_target."
-    if new_target is None:
-        new_target = StringIO()
-    old_target = sys.stderr
-    try:
-        sys.stderr = new_target
-        yield
-    finally:
-        sys.stderr = old_target
-
 
 @contextmanager
 def suspend_logging():
@@ -73,16 +39,6 @@ def suspend_logging():
         yield
     finally:
         logging.disable(logging.NOTSET)
-
-
-class StringIO(io.StringIO):
-    "PY27 compatibility layer."
-
-    def write(self, s):
-        if six.PY2:
-            super(StringIO, self).write(unicode(s))  # noqa
-        else:
-            super(StringIO, self).write(s)
 
 
 class MockScheduler(Scheduler):
@@ -104,7 +60,7 @@ class MockScheduler(Scheduler):
         cls._jobs[cid] = ClusterJob(_id, status=JobStatus.submitted)
         signac_path = os.path.dirname(os.path.dirname(os.path.abspath(signac.__file__)))
         flow_path = os.path.dirname(os.path.dirname(os.path.abspath(flow.__file__)))
-        pythonpath = ':'.join(os.environ.get('PYTHONPATH', []) + [signac_path, flow_path])
+        pythonpath = ':'.join([os.environ.get('PYTHONPATH', '')] + [signac_path, flow_path])
         cls._scripts[cid] = 'export PYTHONPATH={}\n'.format(pythonpath) + script
         return JobStatus.submitted
 
@@ -124,13 +80,8 @@ class MockScheduler(Scheduler):
                         with tempfile.NamedTemporaryFile() as tmpfile:
                             tmpfile.write(cls._scripts[cid].encode('utf-8'))
                             tmpfile.flush()
-                            if six.PY2:
-                                with open(os.devnull, 'w') as devnull:
-                                    subprocess.check_call(
-                                        ['/bin/bash', tmpfile.name], stderr=devnull)
-                            else:
-                                subprocess.check_call(
-                                    ['/bin/bash', tmpfile.name], stderr=subprocess.DEVNULL)
+                            subprocess.check_call(
+                                ['/bin/bash', tmpfile.name], stderr=subprocess.DEVNULL)
                     except Exception:
                         job._status = JobStatus.error
                         raise
@@ -168,13 +119,15 @@ class BaseProjectTest(unittest.TestCase):
         project = self.project_class.get_project(root=self._tmp_dir.name)
         for a in range(3):
             if heterogeneous:
-                project.open_job(dict(a=a)).init()   # heterogeneous
+                # Add jobs with only the `a` key without `b`.
+                project.open_job(dict(a=a)).init()
+                project.open_job(dict(a=dict(a=a))).init()
             for b in range(3):
                 project.open_job(dict(a=a, b=b)).init()
+                project.open_job(dict(a=dict(a=a), b=b)).init()
         return project
 
 
-@unittest.skipIf(six.PY2, 'Only check performance on Python 3')
 class ProjectStatusPerformanceTest(BaseProjectTest):
 
     class Project(FlowProject):
@@ -202,7 +155,7 @@ class ProjectStatusPerformanceTest(BaseProjectTest):
         MockScheduler.reset()
 
         time = timeit.timeit(
-            lambda: project._fetch_status(project, io.StringIO(),
+            lambda: project._fetch_status(project, StringIO(),
                                           ignore_errors=False, no_parallelize=False), number=10)
 
         self.assertTrue(time < 10)
@@ -305,6 +258,52 @@ class ProjectClassTest(BaseProjectTest):
         self.assertEqual(len(b._label_functions), 2)
         self.assertEqual(len(c._label_functions), 1)
 
+    def test_conditions_with_inheritance(self):
+        """
+        Tests the inheritance of pre/post conditions.
+
+        Class A should only have one pre/post condition, while class C that
+        inherits from A should have three, and class B should just have two
+        explicitly defined. Proper execution is tested in the
+        ExecutionProjectTest.
+        """
+        class A(FlowProject):
+            pass
+
+        class B(FlowProject):
+            pass
+
+        class C(A):
+            pass
+
+        @A.pre.always
+        @C.pre.always
+        @C.pre.always
+        @B.pre.always
+        @B.pre.always
+        @A.operation
+        @B.operation
+        def op1(job):
+            pass
+
+        self.assertEqual(len(A._collect_pre_conditions()[op1]), 1)
+        self.assertEqual(len(B._collect_pre_conditions()[op1]), 2)
+        self.assertEqual(len(C._collect_pre_conditions()[op1]), 3)
+
+        @A.post.always
+        @C.post.always
+        @C.post.always
+        @B.post.always
+        @B.post.always
+        @A.operation
+        @B.operation
+        def op2(job):
+            pass
+
+        self.assertEqual(len(A._collect_post_conditions()[op2]), 1)
+        self.assertEqual(len(B._collect_post_conditions()[op2]), 2)
+        self.assertEqual(len(C._collect_post_conditions()[op2]), 3)
+
     def test_with_job_decorator(self):
 
         class A(FlowProject):
@@ -319,7 +318,7 @@ class ProjectClassTest(BaseProjectTest):
         with add_cwd_to_environment_pythonpath():
             with switch_to_directory(project.root_directory()):
                 starting_dir = os.getcwd()
-                with redirect_stderr():
+                with redirect_stderr(StringIO()):
                     A().run()
                 self.assertTrue(os.getcwd(), starting_dir)
 
@@ -350,7 +349,7 @@ class ProjectClassTest(BaseProjectTest):
         with add_cwd_to_environment_pythonpath():
             with switch_to_directory(project.root_directory()):
                 starting_dir = os.getcwd()
-                with redirect_stderr():
+                with redirect_stderr(StringIO()):
                     A().run()
                 self.assertEqual(os.getcwd(), starting_dir)
                 for job in project:
@@ -371,7 +370,7 @@ class ProjectClassTest(BaseProjectTest):
             with switch_to_directory(project.root_directory()):
                 starting_dir = os.getcwd()
                 with self.assertRaises(Exception):
-                    with redirect_stderr():
+                    with redirect_stderr(StringIO()):
                         A().run()
                 self.assertEqual(os.getcwd(), starting_dir)
 
@@ -390,7 +389,7 @@ class ProjectClassTest(BaseProjectTest):
         with add_cwd_to_environment_pythonpath():
             with switch_to_directory(project.root_directory()):
                 starting_dir = os.getcwd()
-                with redirect_stderr():
+                with redirect_stderr(StringIO()):
                     A().run()
                 self.assertEqual(os.getcwd(), starting_dir)
 
@@ -410,6 +409,101 @@ class ProjectClassTest(BaseProjectTest):
             next_op = project.next_operation(job)
             self.assertIn('mpirun -np 3 python', next_op.cmd)
             break
+
+    def test_callable_directives(self):
+
+        class A(FlowProject):
+            pass
+
+        @A.operation
+        @directives(nranks=lambda job: job.doc.get('nranks', 1))
+        @directives(omp_num_threads=lambda job: job.doc.get('omp_num_threads', 1))
+        def a(job):
+            return 'hello!'
+
+        project = A(self.mock_project().config)
+
+        # test setting neither nranks nor omp_num_threads
+        for job in project:
+            next_op = project.next_operation(job)
+            self.assertEqual(next_op.directives['np'], 1)
+
+        # test only setting nranks
+        for i, job in enumerate(project):
+            job.doc.nranks = i+1
+            next_op = project.next_operation(job)
+            self.assertEqual(next_op.directives['np'], next_op.directives['nranks'])
+            del job.doc['nranks']
+
+        # test only setting omp_num_threads
+        for i, job in enumerate(project):
+            job.doc.omp_num_threads = i+1
+            next_op = project.next_operation(job)
+            self.assertEqual(next_op.directives['np'], next_op.directives['omp_num_threads'])
+            del job.doc['omp_num_threads']
+
+        # test setting both nranks and omp_num_threads
+        for i, job in enumerate(project):
+            job.doc.omp_num_threads = i+1
+            job.doc.nranks = i % 3 + 1
+            next_op = project.next_operation(job)
+            expected_np = (i + 1) * (i % 3 + 1)
+            self.assertEqual(next_op.directives['np'], expected_np)
+
+    def test_copy_conditions(self):
+
+        class A(FlowProject):
+            pass
+
+        @A.operation
+        @A.post(lambda job: 'a' in job.doc)
+        def op1(job):
+            job.doc.a = True
+
+        @A.operation
+        @A.post.true('b')
+        def op2(job):
+            job.doc.b = True
+
+        @A.operation
+        @A.pre.after(op1, op2)
+        @A.post.true('c')
+        def op3(job):
+            job.doc.c = True
+
+        @A.operation
+        @A.pre.copy_from(op1, op3)
+        @A.post.true('d')
+        def op4(job):
+            job.doc.d = True
+
+        self.project_class = A
+        project = self.mock_project()
+        op3_ = project.operations['op3']
+        op4_ = project.operations['op4']
+        for job in project:
+            self.assertFalse(op3_.eligible(job))
+            self.assertFalse(op4_.eligible(job))
+
+        project.run(names=['op1'])
+        for job in project:
+            self.assertTrue(job.doc.a)
+            self.assertNotIn('b', job.doc)
+            self.assertNotIn('c', job.doc)
+            self.assertNotIn('d', job.doc)
+            self.assertFalse(op3_.eligible(job))
+            self.assertFalse(op4_.eligible(job))
+
+        project.run(names=['op2'])
+        for job in project:
+            self.assertTrue(op3_.eligible(job))
+            self.assertTrue(op4_.eligible(job))
+
+        project.run()
+        for job in project:
+            self.assertTrue(job.doc.a)
+            self.assertTrue(job.doc.b)
+            self.assertTrue(job.doc.c)
 
 
 class ProjectTest(BaseProjectTest):
@@ -455,15 +549,15 @@ class ProjectTest(BaseProjectTest):
     def test_project_status_homogeneous_schema(self):
         project = self.mock_project()
         for parameters in (None, True, ['a'], ['b'], ['a', 'b']):
-            with redirect_stdout():
-                with redirect_stderr():
+            with redirect_stdout(StringIO()):
+                with redirect_stderr(StringIO()):
                     project.print_status(parameters=parameters, detailed=True)
 
     def test_project_status_heterogeneous_schema(self):
         project = self.mock_project(heterogeneous=True)
         for parameters in (None, True, ['a'], ['b'], ['a', 'b']):
-            with redirect_stdout():
-                with redirect_stderr():
+            with redirect_stdout(StringIO()):
+                with redirect_stderr(StringIO()):
                     project.print_status(parameters=parameters, detailed=True)
 
     def test_script(self):
@@ -511,21 +605,46 @@ class ExecutionProjectTest(BaseProjectTest):
     project_class = TestProject
     expected_number_of_steps = 4
 
-    def test_run(self):
+    def test_pending_operations_order(self):
+        # The execution order of local runs is internally assumed to be
+        # 'by-job' by default. A failure of this unit tests means that
+        # a 'by-job' order must be implemented explicitly within the
+        # FlowProject.run() function.
         project = self.mock_project()
-        output = StringIO()
-        with add_cwd_to_environment_pythonpath():
-            with switch_to_directory(project.root_directory()):
-                with redirect_stderr(output):
-                    project.run()
-        output.seek(0)
-        output.read()
-        even_jobs = [job for job in project if job.sp.b % 2 == 0]
-        for job in project:
-            if job in even_jobs:
-                self.assertTrue(job.isfile('world.txt'))
-            else:
-                self.assertFalse(job.isfile('world.txt'))
+        ops = list(project._get_pending_operations(self.project.find_jobs()))
+        # The length of the list of operations grouped by job is equal
+        # to the length of its set if and only if the operations are grouped
+        # by job already:
+        jobs_order_none = [job._id for job, _ in groupby(ops, key=lambda op: op.job)]
+        self.assertEqual(len(jobs_order_none), len(set(jobs_order_none)))
+
+    def test_run(self):
+        with self.subTest(order='invalid-order'):
+            with self.assertRaises(ValueError):
+                project = self.mock_project()
+                self.project.run(order='invalid-order')
+
+        def sort_key(op):
+            return op.name, op.job.get_id()
+
+        for order in (None, 'none', 'cyclic', 'by-job', 'random', sort_key):
+            for job in self.project.find_jobs():  # clear
+                job.remove()
+            with self.subTest(order=order):
+                project = self.mock_project()
+                output = StringIO()
+                with add_cwd_to_environment_pythonpath():
+                    with switch_to_directory(project.root_directory()):
+                        with redirect_stderr(output):
+                            project.run(order=order)
+                output.seek(0)
+                output.read()
+                even_jobs = [job for job in project if job.sp.b % 2 == 0]
+                for job in project:
+                    if job in even_jobs:
+                        self.assertTrue(job.isfile('world.txt'))
+                    else:
+                        self.assertFalse(job.isfile('world.txt'))
 
     def test_run_with_selection(self):
         project = self.mock_project()
@@ -580,6 +699,91 @@ class ExecutionProjectTest(BaseProjectTest):
                 self.assertTrue(job.isfile('world.txt'))
             else:
                 self.assertFalse(job.isfile('world.txt'))
+
+    def test_run_condition_inheritance(self):
+
+        # This assignment is necessary to use the `mock_project` function on
+        # classes A, B, and C. Otherwise, the self.project_class reassignment
+        # would break future tests.
+        _project = getattr(self, 'project_class', None)
+
+        class A(FlowProject):
+            pass
+
+        class B(FlowProject):
+            pass
+
+        class C(A):
+            pass
+
+        # Never post conditions are to prevent warnings on operations without
+        # post conditions
+        @A.pre.never
+        @B.pre.always
+        @A.post.never
+        @B.post.never
+        @A.operation
+        @B.operation
+        def op1(job):
+            job.doc.op1 = True
+
+        @A.pre.always
+        @B.pre.never
+        @A.post.never
+        @B.post.never
+        @A.operation
+        @B.operation
+        def op2(job):
+            job.doc.op2 = True
+
+        @A.pre.always
+        @C.pre.never
+        @B.pre.never
+        @A.post.never
+        @B.post.never
+        @A.operation
+        @B.operation
+        def op3(job):
+            job.doc.op3 = True
+
+        all_ops = set(['op1', 'op2', 'op3'])
+        for project_class, bad_ops in zip(
+                [A, B, C],
+                [['op1'], ['op2', 'op3'], ['op1', 'op3']]):
+
+            self.project_class = project_class
+            for job in self.project.find_jobs():
+                job.remove()
+            project = self.mock_project()
+            project.run()
+            # All bad operations do not run
+            assert all([not job.doc.get(op, False)
+                        for op in bad_ops
+                        for job in project])
+            # All good operations do run
+            good_ops = all_ops.difference(bad_ops)
+            assert all([job.doc.get(op, False)
+                        for op in good_ops
+                        for job in project])
+        self.project_class = _project
+
+    def test_run_fork(self):
+        project = self.mock_project()
+        output = StringIO()
+        for job in project:
+            job.doc.fork = True
+            break
+
+        with add_cwd_to_environment_pythonpath():
+            with switch_to_directory(project.root_directory()):
+                with redirect_stderr(output):
+                    project.run()
+
+        for job in project:
+            if job.doc.get('fork'):
+                self.assertNotEqual(os.getpid(), job.doc.test)
+            else:
+                self.assertEqual(os.getpid(), job.doc.test)
 
     def test_submit_operations(self):
         MockScheduler.reset()
@@ -696,7 +900,6 @@ class ExecutionProjectTest(BaseProjectTest):
                     job_status['operations'][op]['scheduler_status'],
                     (JobStatus.unknown, JobStatus.inactive))
 
-    @unittest.skipIf(six.PY2, 'logger output not caught for Python 2.7')
     def test_submit_operations_bad_directive(self):
         MockScheduler.reset()
         project = self.mock_project()
@@ -716,14 +919,13 @@ class ExecutionProjectTest(BaseProjectTest):
     def test_condition_evaluation(self):
         project = self.mock_project()
 
-        # Can't use the 'nonlocal' keyword with Python 2.7.
-        nonlocal_ = dict(evaluated=0)
+        evaluated = 0
         state = None
 
         def make_cond(cond):
             def cond_func(job):
-                # Would prefer to use 'nonlocal' keyword, but not available for Python 2.7.
-                nonlocal_['evaluated'] |= cond
+                nonlocal evaluated
+                evaluated |= cond
                 return cond & state
             return cond_func
 
@@ -760,9 +962,9 @@ class ExecutionProjectTest(BaseProjectTest):
                                        # are met, need to evaluate all.
                     (0b1111, 0b1111),  # All conditions met, need to evaluate all.
             ]:
-                nonlocal_['evaluated'] = 0
+                evaluated = 0
                 project.run()
-                self.assertEqual(nonlocal_['evaluated'], expected_evaluation)
+                self.assertEqual(evaluated, expected_evaluation)
 
 
 class BufferedExecutionProjectTest(ExecutionProjectTest):
@@ -921,11 +1123,7 @@ class ProjectMainInterfaceTest(BaseProjectTest):
         try:
             with add_path_to_environment_pythonpath(os.path.abspath(self.cwd)):
                 with switch_to_directory(self.project.root_directory()):
-                    if six.PY2:
-                        with open(os.devnull, 'w') as devnull:
-                            return subprocess.check_output(_cmd.split(), stderr=devnull)
-                    else:
-                        return subprocess.check_output(_cmd.split(), stderr=subprocess.DEVNULL)
+                    return subprocess.check_output(_cmd.split(), stderr=subprocess.DEVNULL)
         except subprocess.CalledProcessError as error:
             print(error, file=sys.stderr)
             print(error.output, file=sys.stderr)
