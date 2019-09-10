@@ -1811,11 +1811,17 @@ class FlowProject(signac.contrib.Project, metaclass=_FlowProjectClass):
 
         # Execute without forking if possible...
         if timeout is None and operation.name in self._operation_functions and \
-                operation.directives.get('executable', sys.executable) == sys.executable:
+                operation.directives.get('executable', sys.executable) == sys.executable and \
+                operation.directives.get('nranks', None):
             logger.debug("Able to optimize execution of operation '{}'.".format(operation))
             self._operation_functions[operation.name](operation.job)
         else:   # need to fork
-            subprocess.call(operation.cmd, shell=True, timeout=timeout)
+            if operation.directives.get('nranks', None):
+                nranks = operation.directives['nranks']
+                subprocess.call("mpiexec -n {} ".format(nranks) + operation.cmd,
+                                shell=True, timeout=timeout)
+            else:
+                subprocess.call(operation.cmd, shell=True, timeout=timeout)
 
     def run(self, jobs=None, names=None, pretend=False, np=None, timeout=None, num=None,
             num_passes=1, progress=False, order=None):
