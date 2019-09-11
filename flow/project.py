@@ -1809,24 +1809,29 @@ class FlowProject(signac.contrib.Project, metaclass=_FlowProjectClass):
     def _fork(self, operation, timeout=None):
         logger.info("Execute operation '{}'...".format(operation))
 
-        # Execute without forking if possible...
-        if timeout is None and operation.name in self._operation_functions and \
-                operation.directives.get('executable', sys.executable) == sys.executable and \
-                operation.directives.get('nranks', None) and \
-                operation.directives.get('omp_num_threads', None):
+        # Execute with forking if necessary...
+        nranks = operation.directives.get('nranks', None)
+        omp_num_threads = operation.directives.get('omp_num_threads', None)
+        # for multiprocessing and multithreading
+        if nranks or omp_num_threads:
+            mpi_prefix = 'mpiexec -n {} '.format(nranks)
+            cmd = mpi_prefix + operation.cmd if nranks else operation.cmd
+            if omp_num_threads:
+                # necessary to create environment in case mutliple operations
+                # are run in parallel with different thread numbers
+                op_env = os.environ.copy()
+                op_env['OMP_NUM_THREADS'] = str(omp_num_threads)
+                subprocess.call(cmd, shell=True, env=op_env, timeout=timeout)
+            else:
+                subprocess.call(cmd, shell=True, env=op_env, timeout=timeout)
+        # for shell commands and specified executables
+        elif operation.directives.get('executable', sys.executable) != sys.executable or \
+                timeout is not None or operation.name not in self._operation_functions:
+            subprocess.call(operation.cmd, shell=True, timeout=timeout)
+        # can run without forking
+        else:
             logger.debug("Able to optimize execution of operation '{}'.".format(operation))
             self._operation_functions[operation.name](operation.job)
-        else:   # need to fork
-            op_env = os.environ.copy()
-            if operation.directives.get('omp_num_threads', None):
-                op_env['OMP_NUM_THREADS'] = str(operation.directives['omp_num_threads'])
-            if operation.directives.get('nranks', None):
-                nranks = operation.directives['nranks']
-
-                subprocess.call("mpiexec -n {} ".format(nranks) + operation.cmd,
-                                shell=True, env=op_env, timeout=timeout)
-            else:
-                subprocess.call(operation.cmd, shell=True, env=op_env, timeout=timeout)
 
     def run(self, jobs=None, names=None, pretend=False, np=None, timeout=None, num=None,
             num_passes=1, progress=False, order=None):
