@@ -40,7 +40,7 @@ def _fetch(user=None):
     if user is None:
         user = getpass.getuser()
 
-    cmd = ['bjobs', '-json', '-u', user]
+    cmd = ['bjobs', '-u', user, '-o', 'jobid stat user job_name', '-json']
     try:
         result = json.loads(subprocess.check_output(cmd).decode('utf-8'))
     except subprocess.CalledProcessError:
